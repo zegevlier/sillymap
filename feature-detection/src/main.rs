@@ -1,16 +1,12 @@
 use image::{GenericImageView, ImageReader};
 
-fn convolve<const N: usize>(
-    input: &[u8],
-    width: u32,
-    height: u32,
-    kernel: &[[f32; N]; N],
-    output: &mut [f32],
-) {
+fn convolve(input: &[f32], width: u32, height: u32, kernel: &[&[f32]], output: &mut [f32]) {
     // The kernel should always be odd-sized, and thus have a midpoint.
-    assert!(N / 2 * 2 != N);
+    assert!(kernel.len() / 2 * 2 != kernel.len());
+    // The kernel should always be square
+    assert!(kernel.len() == kernel[0].len());
 
-    let kernel_midpoint = (N / 2) as i32;
+    let kernel_midpoint = (kernel.len() / 2) as i32;
     // For a 3x3 kernel, we want to go from -1, 0, 1,
     // kernel_midpoint would be 1, so we want to go from -kernel_midpoint..=kernel_midpoint
 
@@ -27,7 +23,7 @@ fn convolve<const N: usize>(
                     // If it is in range, we find out the multiplier.
                     let multiplier = kernel[(kernel_x + kernel_midpoint) as usize]
                         [(kernel_y + kernel_midpoint) as usize];
-                    result += input[val_idx] as f32 * multiplier;
+                    result += input[val_idx] * multiplier;
                 }
             }
             output[idx] = result;
@@ -47,6 +43,62 @@ fn debug_output_image(pixels: &[f32], width: u32, height: u32, path: &str) {
     debug_image.save(path).unwrap();
 }
 
+fn gaussian_convolution(input: Vec<f32>, width: u32, height: u32, sigma: f32) -> Vec<f32> {
+    // We set the radius of the Gaussian kernel to be 3 times the sigma, rounded up.
+    // This is apparently a common choice.
+    let radius = (sigma * 3.).ceil() as isize;
+    let center = radius;
+    // The gaussian kernel size should be 2*radius, but because we want the center pixel, we add 1.
+    let gaussian_size = (radius * 2 + 1) as usize;
+
+    // We can pre-compute the inverse coefficient, as it does not depend on x or y.
+    // Same with 2*sigma^2
+    let inv_coeff = 1. / 2. * std::f32::consts::PI * sigma.powi(2);
+    let two_sigma_sq = 2. * sigma.powi(2);
+
+    // Now we create the Gaussian kernel.
+    let mut kernel = vec![vec![0.; gaussian_size]; gaussian_size];
+    let mut sum = 0.0;
+
+    // Fill in the kernel values.
+    #[allow(clippy::needless_range_loop)]
+    for x in 0..gaussian_size {
+        for y in 0..gaussian_size {
+            // We need to use dx and dy as the function is centered around (0,0),
+            // but we need to center it around (center, center).
+            let dx = (x as isize - center) as f32;
+            let dy = (y as isize - center) as f32;
+            let exp = -(dx.powi(2) + dy.powi(2)) / two_sigma_sq;
+            let val = inv_coeff * exp.exp();
+            kernel[x][y] = val;
+            sum += val;
+        }
+    }
+
+    // Normalize the kernel so that the sum of all elements is 1.
+    #[allow(clippy::needless_range_loop)]
+    for x in 0..gaussian_size {
+        for y in 0..gaussian_size {
+            kernel[x][y] /= sum;
+        }
+    }
+
+    // Our output will be the same size as our input, initialize it.
+    let mut output = vec![0.; input.len()];
+
+    // Now we perform the convolution.
+    convolve(
+        &input,
+        width,
+        height,
+        // TODO: There is probably a better way to do this conversion.
+        &kernel.iter().map(|v| v.as_slice()).collect::<Vec<&[f32]>>(),
+        &mut output,
+    );
+
+    output
+}
+
 fn detect_features(pixels: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
     assert_eq!(pixels.len() as u32, width * height);
     println!(
@@ -56,44 +108,17 @@ fn detect_features(pixels: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
         pixels.len()
     );
 
-    // First, we will convolve the image with both the Sobel X and Y kernels to get the gradients.
-
-    let sobel_x: [[f32; 3]; 3] = [[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]];
-    let mut gradients_x = vec![0f32; pixels.len()];
-    convolve(pixels, width, height, &sobel_x, &mut gradients_x);
+    let float_pixels: Vec<f32> = pixels.iter().map(|&p| p as f32).collect();
+    let blurred_pixels = gaussian_convolution(float_pixels, width, height, 2.);
 
     debug_output_image(
-        &gradients_x,
+        &blurred_pixels,
         width,
         height,
-        "../output/feature-detection/gradient_x.png",
+        "../output/feature-detection/blurred.png",
     );
 
-    let sobel_y: [[f32; 3]; 3] = [[1., 2., 1.], [0., 0., 0.], [-1., -2., -1.]];
-    let mut gradients_y = vec![0f32; pixels.len()];
-    convolve(pixels, width, height, &sobel_y, &mut gradients_y);
-
-    debug_output_image(
-        &gradients_y,
-        width,
-        height,
-        "../output/feature-detection/gradient_y.png",
-    );
-
-    // Now, we combine the gradients to get the gradient magnitude.
-    let mut gradient_magnitude = vec![0f32; pixels.len()];
-    for i in 0..pixels.len() {
-        gradient_magnitude[i] =
-            (gradients_x[i].powi(2) + gradients_y[i].powi(2)).sqrt();
-    }
-
-    debug_output_image(&gradient_magnitude, width, height, "../output/feature-detection/gradient_magnitude.png");
-
-
-
-
-
-    unimplemented!("Feature detection logic not yet implemented");
+    vec![]
 }
 
 fn main() {

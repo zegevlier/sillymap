@@ -1,105 +1,140 @@
+use std::cmp::Ordering;
+
 use image::{GenericImageView, ImageReader};
 
-fn convolve(input: &[f32], width: u32, height: u32, kernel: &[&[f32]], output: &mut [f32]) {
-    // The kernel should always be odd-sized, and thus have a midpoint.
-    assert!(kernel.len() / 2 * 2 != kernel.len());
-    // The kernel should always be square
-    assert!(kernel.len() == kernel[0].len());
+mod pixel_image;
+use pixel_image::Image;
 
-    let kernel_midpoint = (kernel.len() / 2) as i32;
-    // For a 3x3 kernel, we want to go from -1, 0, 1,
-    // kernel_midpoint would be 1, so we want to go from -kernel_midpoint..=kernel_midpoint
+const S: u32 = 3;
+const SIGMA_0: f32 = 1.6;
+const IMAGES_PER_OCTAVE: u32 = S + 3;
 
-    for x in 0..width {
-        for y in 0..height {
-            let idx = (y * width + x) as usize;
-            let mut result = 0.;
-            for kernel_x in -kernel_midpoint..=kernel_midpoint {
-                for kernel_y in -kernel_midpoint..=kernel_midpoint {
-                    let val_x = (x as i32 + kernel_y).clamp(0, width as i32 - 1) as u32;
-                    let val_y = (y as i32 + kernel_x).clamp(0, height as i32 - 1) as u32;
-                    let val_idx = (val_y * width + val_x) as usize;
+struct Octave {
+    // The S+3 blurred images
+    gaussians: Vec<Image>,
+    // Difference-of-gaussians, the S+2 differences of these blurred images
+    dogs: Vec<Image>,
+}
 
-                    // If it is in range, we find out the multiplier.
-                    let multiplier = kernel[(kernel_x + kernel_midpoint) as usize]
-                        [(kernel_y + kernel_midpoint) as usize];
-                    result += input[val_idx] * multiplier;
+fn build_octaves(input_image: Image, num_octaves: u32) -> Vec<Octave> {
+    let mut octaves = Vec::with_capacity(num_octaves as usize);
+
+    // We need to double the input image size first, as per the SIFT paper.
+    let initial_resized = input_image.resize_double();
+
+    // We then need to make sure the initial sigma is correct.
+    // The paper assumes that the input image has sigma 0.5, doubled that would be 1.0,
+    // and it needs to reach SIGMA_0 (1.6).
+    let sigma_diff = (SIGMA_0 * SIGMA_0 - 1.0 * 1.0).sqrt();
+    let mut current_base_image = initial_resized.gaussian_blur(sigma_diff);
+
+    let k = 2_f32.powf(1. / S as f32);
+
+    for _ in 0..num_octaves {
+        let mut octave_gaussians = vec![];
+        octave_gaussians.push(current_base_image.clone());
+
+        let mut current_sigma = SIGMA_0;
+
+        for _ in 1..IMAGES_PER_OCTAVE {
+            // We first need to calculate the sigma ew need to blur the previous image with.
+            // We want the current sigma to be the previous sigma * k.
+            // So, the sigma we need to use = sqrt((current sigma * k)^2 - (current sigma)^2)
+            // This works out to current sigma * sqrt(k^2-1)
+            let sigma = current_sigma * (k.powi(2) - 1.).sqrt();
+
+            let previous_image = octave_gaussians.last().unwrap();
+            let new_image = previous_image.gaussian_blur(sigma);
+
+            octave_gaussians.push(new_image);
+
+            // Update the current sigma value.
+            current_sigma *= k;
+        }
+
+        let mut octave_dogs = vec![];
+        for i in 0..(IMAGES_PER_OCTAVE as usize - 1) {
+            let dog = octave_gaussians[i + 1].subtract(&octave_gaussians[i]);
+            octave_dogs.push(dog)
+        }
+
+        // Now, we downsample the image, as per the paper.
+        // We need to that the Sth image from the octave gaussians, and downsample that.
+        let image_to_downsample = octave_gaussians[S as usize].clone();
+        current_base_image = image_to_downsample.resize_half();
+
+        octaves.push(Octave {
+            gaussians: octave_gaussians,
+            dogs: octave_dogs,
+        });
+    }
+
+    // We first need to double the size of the input image.
+    octaves
+}
+
+#[derive(Debug)]
+struct DiscreteKeyPoint {
+    octave: usize,
+    // This is the DoG image index within the octave.
+    layer: usize,
+    x: u32,
+    y: u32,
+}
+
+fn is_extrema(dogs: &[Image], layer_idx: usize, x: u32, y: u32) -> bool {
+    let current = dogs[layer_idx].get_pixel(x, y);
+    let ordering = current.total_cmp(&dogs[layer_idx].get_pixel(x + 1, y));
+    if ordering == Ordering::Equal {
+        return false;
+    }
+    for dl in -1..=1 {
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if dl == 0 && dx == 0 && dy == 0 {
+                    continue;
+                }
+                if current.total_cmp(
+                    &dogs[(layer_idx as isize + dl) as usize]
+                        .get_pixel((x as i32 + dx) as u32, (y as i32 + dy) as u32),
+                ) != ordering
+                {
+                    return false;
                 }
             }
-            output[idx] = result;
         }
     }
+    true
 }
 
-fn debug_output_image(pixels: &[f32], width: u32, height: u32, path: &str) {
-    let mut debug_image = image::GrayImage::new(width, height);
-    for x in 0..width {
-        for y in 0..height {
-            let idx = (y * width + x) as usize;
-            let value = pixels[idx].abs().min(255.) as u8;
-            debug_image.put_pixel(x, y, image::Luma([value]));
+fn detect_extrema(octaves: &[Octave]) -> Vec<DiscreteKeyPoint> {
+    let mut keypoint_candidates = vec![];
+
+    for (octave_idx, octave) in octaves.iter().enumerate() {
+        // We can only look at the layers that have both a top and a bottom neighbour
+        for layer_idx in 1..octave.dogs.len() - 1 {
+            let width = octave.dogs[layer_idx].get_width();
+            let height = octave.dogs[layer_idx].get_height();
+            // Similarly here, we need to avoid the borders
+            for x in 1..width {
+                for y in 1..height {
+                    if is_extrema(&octave.dogs, layer_idx, x, y) {
+                        keypoint_candidates.push(DiscreteKeyPoint {
+                            octave: octave_idx,
+                            layer: layer_idx,
+                            x,
+                            y,
+                        });
+                    }
+                }
+            }
         }
     }
-    debug_image.save(path).unwrap();
+
+    keypoint_candidates
 }
 
-fn gaussian_convolution(input: Vec<f32>, width: u32, height: u32, sigma: f32) -> Vec<f32> {
-    // We set the radius of the Gaussian kernel to be 3 times the sigma, rounded up.
-    // This is apparently a common choice.
-    let radius = (sigma * 3.).ceil() as isize;
-    let center = radius;
-    // The gaussian kernel size should be 2*radius, but because we want the center pixel, we add 1.
-    let gaussian_size = (radius * 2 + 1) as usize;
-
-    // We can pre-compute the inverse coefficient, as it does not depend on x or y.
-    // Same with 2*sigma^2
-    let inv_coeff = 1. / 2. * std::f32::consts::PI * sigma.powi(2);
-    let two_sigma_sq = 2. * sigma.powi(2);
-
-    // Now we create the Gaussian kernel.
-    let mut kernel = vec![vec![0.; gaussian_size]; gaussian_size];
-    let mut sum = 0.0;
-
-    // Fill in the kernel values.
-    #[allow(clippy::needless_range_loop)]
-    for x in 0..gaussian_size {
-        for y in 0..gaussian_size {
-            // We need to use dx and dy as the function is centered around (0,0),
-            // but we need to center it around (center, center).
-            let dx = (x as isize - center) as f32;
-            let dy = (y as isize - center) as f32;
-            let exp = -(dx.powi(2) + dy.powi(2)) / two_sigma_sq;
-            let val = inv_coeff * exp.exp();
-            kernel[x][y] = val;
-            sum += val;
-        }
-    }
-
-    // Normalize the kernel so that the sum of all elements is 1.
-    #[allow(clippy::needless_range_loop)]
-    for x in 0..gaussian_size {
-        for y in 0..gaussian_size {
-            kernel[x][y] /= sum;
-        }
-    }
-
-    // Our output will be the same size as our input, initialize it.
-    let mut output = vec![0.; input.len()];
-
-    // Now we perform the convolution.
-    convolve(
-        &input,
-        width,
-        height,
-        // TODO: There is probably a better way to do this conversion.
-        &kernel.iter().map(|v| v.as_slice()).collect::<Vec<&[f32]>>(),
-        &mut output,
-    );
-
-    output
-}
-
-fn detect_features(pixels: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
+fn sift(pixels: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
     assert_eq!(pixels.len() as u32, width * height);
     println!(
         "Feature detection would be performed on an image of dimensions {}x{} with {} pixels.",
@@ -108,15 +143,35 @@ fn detect_features(pixels: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
         pixels.len()
     );
 
-    let float_pixels: Vec<f32> = pixels.iter().map(|&p| p as f32).collect();
-    let blurred_pixels = gaussian_convolution(float_pixels, width, height, 2.);
+    let image = Image::new_u8(width, height, pixels.to_vec());
 
-    debug_output_image(
-        &blurred_pixels,
-        width,
-        height,
-        "../output/feature-detection/blurred.png",
-    );
+    let resized_image = image.resize_half();
+
+    resized_image.write_debug_out("../output/feature-detection/resized.png");
+
+    let octaves = build_octaves(image, 4);
+
+    // We write them all out to files, for debugging purposes.
+    for (octave_index, octave) in octaves.iter().enumerate() {
+        for (gaussian_index, gaussian) in octave.gaussians.iter().enumerate() {
+            let path = format!(
+                "../output/feature-detection/octave_{}_gaussian_{}.png",
+                octave_index, gaussian_index
+            );
+            gaussian.write_debug_out(&path);
+        }
+        for (dog_index, dog) in octave.dogs.iter().enumerate() {
+            let path = format!(
+                "../output/feature-detection/octave_{}_dog_{}.png",
+                octave_index, dog_index
+            );
+            dog.write_debug_out(&path);
+        }
+    }
+
+    let extrema = detect_extrema(&octaves);
+
+    dbg!(extrema);
 
     vec![]
 }
@@ -148,7 +203,7 @@ fn main() {
 
     // Now we do the actual feature detection.
     println!("Detecting features...");
-    let features = detect_features(&pixels, width, height);
+    let features = sift(&pixels, width, height);
 
     // We write out the features to a file, so that we can inspect them later.
     println!("Writing features to file...");

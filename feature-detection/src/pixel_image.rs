@@ -232,4 +232,10 @@ impl Image {
     pub(crate) fn get_pixel(&self, x: u32, y: u32) -> f32 {
         self.data[(self.width * x + y) as usize]
     }
+
+    pub fn get_pixeli(&self, x: i32, y: i32) -> f32 {
+        let clamped_x = x.clamp(0, (self.width - 1) as i32) as u32;
+        let clamped_y = y.clamp(0, (self.height - 1) as i32) as u32;
+        self.data[(self.width * clamped_y + clamped_x) as usize]
+    }
 }

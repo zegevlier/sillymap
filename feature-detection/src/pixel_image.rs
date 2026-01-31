@@ -127,11 +127,9 @@ impl Image {
         }
     }
 
-    pub fn convolve(&self, kernel: &[&[f32]]) -> Self {
+    pub fn convolve_x(&self, kernel: &[f32]) -> Self {
         // The kernel should always be odd-sized, and thus have a midpoint.
         assert!(kernel.len() % 2 == 1);
-        // The kernel should always be square
-        assert!(kernel.len() == kernel[0].len());
 
         let kernel_midpoint = (kernel.len() / 2) as i32;
         // For a 3x3 kernel, we want to go from -1, 0, 1,
@@ -144,16 +142,12 @@ impl Image {
                 let idx = (y * self.width + x) as usize;
                 let mut result = 0.;
                 for kernel_x in -kernel_midpoint..=kernel_midpoint {
-                    for kernel_y in -kernel_midpoint..=kernel_midpoint {
-                        let val_x = (x as i32 + kernel_y).clamp(0, self.width as i32 - 1) as u32;
-                        let val_y = (y as i32 + kernel_x).clamp(0, self.height as i32 - 1) as u32;
-                        let val_idx = (val_y * self.width + val_x) as usize;
+                    let val_x = (x as i32 + kernel_x).clamp(0, self.width as i32 - 1) as u32;
+                    let val_idx = (y * self.width + val_x) as usize;
 
-                        // If it is in range, we find out the multiplier.
-                        let multiplier = kernel[(kernel_x + kernel_midpoint) as usize]
-                            [(kernel_y + kernel_midpoint) as usize];
-                        result += self.data[val_idx] * multiplier;
-                    }
+                    // If it is in range, we find out the multiplier.
+                    let multiplier = kernel[(kernel_x + kernel_midpoint) as usize];
+                    result += self.data[val_idx] * multiplier;
                 }
                 output[idx] = result;
             }
@@ -161,11 +155,26 @@ impl Image {
         output_image
     }
 
+    pub fn transpose(&self) -> Self {
+        let mut new_data = vec![0.0; (self.width * self.height) as usize];
+        for x in 0..self.width {
+            for y in 0..self.height {
+                let old_idx = (y * self.width + x) as usize;
+                let new_idx = (x * self.height + y) as usize;
+                new_data[new_idx] = self.data[old_idx];
+            }
+        }
+
+        Image::new(self.height, self.width, new_data)
+    }
+
     pub fn gaussian_blur(&self, sigma: f32) -> Self {
+        // We use an optimized version of the gaussian blur, where we first blur in the x direction,
+        // then in the y direction.
         // We set the radius of the Gaussian kernel to be 3 times the sigma, rounded up.
-        // This is apparently a common choice.
         let radius = (sigma * 3.).ceil() as isize;
         let center = radius;
+
         // The gaussian kernel size should be 2*radius, but because we want the center pixel, we add 1.
         let gaussian_size = (radius * 2 + 1) as usize;
 
@@ -175,37 +184,30 @@ impl Image {
         let two_sigma_sq = 2. * sigma.powi(2);
 
         // Now we create the Gaussian kernel.
-        let mut kernel = vec![vec![0.; gaussian_size]; gaussian_size];
+        let mut kernel = vec![0.; gaussian_size];
         let mut sum = 0.0;
 
         // Fill in the kernel values.
         #[allow(clippy::needless_range_loop)]
         for x in 0..gaussian_size {
-            for y in 0..gaussian_size {
-                // We need to use dx and dy as the function is centered around (0,0),
-                // but we need to center it around (center, center).
-                let dx = (x as isize - center) as f32;
-                let dy = (y as isize - center) as f32;
-                let exp = -(dx.powi(2) + dy.powi(2)) / two_sigma_sq;
-                let val = inv_coeff * exp.exp();
-                kernel[x][y] = val;
-                sum += val;
-            }
+            // We need to use dx as the function is centered around (0,0),
+            // but we need to center it around (center).
+            let dx = (x as isize - center) as f32;
+            let exp = -(dx.powi(2)) / two_sigma_sq;
+            let val = inv_coeff * exp.exp();
+            kernel[x] = val;
+            sum += val;
         }
 
-        // Normalize the kernel so that the sum of all elements is 1.
-        #[allow(clippy::needless_range_loop)]
-        for x in 0..gaussian_size {
-            for y in 0..gaussian_size {
-                kernel[x][y] /= sum;
-            }
-        }
+        let kernel = kernel.iter().map(|v| v / sum).collect::<Vec<_>>();
 
-        // Now we perform the convolution.
-        self.convolve(
-            // TODO: There is probably a better way to do this conversion.
-            &kernel.iter().map(|v| v.as_slice()).collect::<Vec<&[f32]>>(),
-        )
+        // First, we blur in the x direction.
+        let temp_image = self.convolve_x(&kernel);
+        // Then, we blur in the y direction. To do this, we transpose the
+        // image, convolve in x direction again, then transpose back.
+        let transposed_image = temp_image.transpose();
+        let blurred_transposed = transposed_image.convolve_x(&kernel);
+        blurred_transposed.transpose()
     }
 
     pub fn subtract(&self, other: &Self) -> Self {

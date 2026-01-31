@@ -20,7 +20,7 @@ impl Image {
         Image {
             width,
             height,
-            data: data.iter().map(|&p| p as f32).collect(),
+            data: data.iter().map(|&p| p as f32 / 255.).collect(),
         }
     }
 
@@ -37,7 +37,7 @@ impl Image {
         for x in 0..self.width {
             for y in 0..self.height {
                 let idx = (y * self.width + x) as usize;
-                let pixel_value = self.data[idx].clamp(0.0, 255.0) as u8;
+                let pixel_value = (self.data[idx] * 255.0).clamp(0.0, 255.0) as u8;
                 debug_image.put_pixel(x, y, image::Luma([pixel_value]));
             }
         }
@@ -230,7 +230,7 @@ impl Image {
     }
 
     pub(crate) fn get_pixel(&self, x: u32, y: u32) -> f32 {
-        self.data[(self.width * x + y) as usize]
+        self.data[(self.width * y + x) as usize]
     }
 
     pub fn get_pixeli(&self, x: i32, y: i32) -> f32 {

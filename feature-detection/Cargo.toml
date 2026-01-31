@@ -9,3 +9,6 @@ image = { version = "0.25.9", default-features = false, features = [
     "jpeg",
 ] }
 nalgebra = "0.34.1"
+
+[profile.release]
+debug = true

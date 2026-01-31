@@ -198,6 +198,7 @@ fn determine_derivatives(
 
 const R: f32 = 10.;
 const EDGE_CHECK_THRESHOLD: f32 = ((R + 1.) * (R + 1.)) / R;
+const CONTRAST_THRESHOLD: f32 = 0.015;
 
 fn sift(pixels: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
     assert_eq!(pixels.len() as u32, width * height);
@@ -239,6 +240,8 @@ fn sift(pixels: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
     let mut keypoints = vec![];
     let mut convergent_count = 0;
     let mut nonconvergent_count = 0;
+    let mut discarded_low_contrast = 0;
+    let mut discarded_edge = 0;
 
     for extrema_point in extrema {
         // For each extrema point, we determine the derivatives.
@@ -292,7 +295,8 @@ fn sift(pixels: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
 
         let d_hat = val_c + 0.5 * gradient.dot(&offset);
 
-        if d_hat.abs() < 0.03 {
+        if d_hat.abs() < CONTRAST_THRESHOLD {
+            discarded_low_contrast += 1;
             continue;
         }
 
@@ -315,6 +319,7 @@ fn sift(pixels: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
 
         if (tr.powi(2) / det) >= EDGE_CHECK_THRESHOLD {
             // Discard this point, it's on an edge.
+            discarded_edge += 1;
             continue;
         }
 
@@ -329,8 +334,8 @@ fn sift(pixels: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
     }
 
     println!(
-        "Converged keypoints: {}, non-converged keypoints: {}",
-        convergent_count, nonconvergent_count
+        "Converged keypoints: {}, non-converged keypoints: {}, discarded low-contrast keypoints: {}, discarded edge keypoints: {}",
+        convergent_count, nonconvergent_count, discarded_low_contrast, discarded_edge
     );
 
     dbg!(&keypoints.len());
